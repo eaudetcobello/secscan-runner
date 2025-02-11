@@ -1,26 +1,21 @@
+import click
+import yaml
 import asyncio
+from loguru import logger
 from pathlib import Path
-from typing import Tuple
-
-images = [
-    "ghcr.io/canonical/cilium-operator-generic:1.16.3-ck0",
-    "ghcr.io/canonical/cilium:1.16.3-ck0",
-    "ghcr.io/canonical/coredns:1.11.3-ck0",
-    "ghcr.io/canonical/frr:9.1.0",
-    "ghcr.io/canonical/k8s-snap/pause:3.10",
-    "ghcr.io/canonical/k8s-snap/sig-storage/csi-node-driver-registrar:v2.10.1",
-    "ghcr.io/canonical/k8s-snap/sig-storage/csi-provisioner:v5.0.1",
-    "ghcr.io/canonical/k8s-snap/sig-storage/csi-resizer:v1.11.1",
-    "ghcr.io/canonical/k8s-snap/sig-storage/csi-snapshotter:v8.0.1",
-    "ghcr.io/canonical/metallb-controller:v0.14.8-ck0",
-    "ghcr.io/canonical/metallb-speaker:v0.14.8-ck0",
-    "ghcr.io/canonical/metrics-server:0.7.2-ck0",
-    "ghcr.io/canonical/rawfile-localpv:0.8.1",
-]
+from functools import wraps
 
 OUTPUT_DIR = Path("output")
 TOKEN_DIR = OUTPUT_DIR / "tokens"
 IMAGE_DIR = OUTPUT_DIR / "images"
+
+
+def coro(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(f(*args, **kwargs))
+
+    return wrapper
 
 
 def get_image_filename(image: str):
@@ -36,11 +31,11 @@ async def run_async(cmd: str) -> tuple[int, bytes]:
     stdout, stderr = await process.communicate()
 
     if process.returncode != 0:
-        print(f"Failed to run {cmd}")
-        print(stderr.decode())
+        logger.error(f"Failed to run {cmd}")
+        logger.error(stderr.decode())
         return 1, stderr
     else:
-        print(f"Ran {cmd}")
+        logger.debug(f"Ran {cmd}")
 
     return 0, stdout
 
@@ -56,9 +51,9 @@ async def save_image(image: str):
         if code == 0:
             _ = image_path.write_bytes(output)
         else:
-            print(f"!!! Failed to export {image}.")
+            logger.error(f"!!! Failed to export {image}.")
     else:
-        print(f"File {image_path} already exists, skipping.")
+        logger.info(f"File {image_path} already exists, skipping.")
 
 
 async def run_scan(image: str):
@@ -66,19 +61,19 @@ async def run_scan(image: str):
     image_path = IMAGE_DIR / f"{image_filename}.image"
 
     if not image_path.exists():
-        print(f"Image {image_filename} does not exist, skipping scan.")
+        logger.info(f"Image {image_filename} does not exist, skipping scan.")
         return
 
     submit_scan_cmd = f"secscan-client submit --scanner blackduck --type container-image --format oci {image_path}"
 
     code, scan_token = await run_async(submit_scan_cmd)
     if code != 0:
-        print(f"!!! Failed to submit scan for {image}")
+        logger.error(f"!!! Failed to submit scan for {image}")
         return
 
     scan_token = scan_token.decode().strip().replace("Scan request submitted.", "")
 
-    print(f"Scan token for {image}: {scan_token}")
+    logger.info(f"Scan token for {image}: {scan_token}")
 
     # Write token to file
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
@@ -89,7 +84,7 @@ async def run_scan(image: str):
 
     code, _ = await run_async(wait_cmd)
     if code != 0:
-        print(f"!!! Failed to wait for scan for {image_filename}")
+        logger.error(f"!!! Failed to wait for scan for {image_filename}")
         return
 
     report_path = OUTPUT_DIR / f"{image_filename}/{image_filename}.report"
@@ -99,7 +94,7 @@ async def run_scan(image: str):
     if code == 0:
         _ = report_path.write_text(output.decode())
     else:
-        print(f"!!! Failed to get report for {image}")
+        logger.error(f"!!! Failed to get report for {image}")
         return
 
     result_path = OUTPUT_DIR / f"{image_filename}/{image_filename}.result"
@@ -109,28 +104,80 @@ async def run_scan(image: str):
     if code == 0:
         _ = result_path.write_text(output.decode())
     else:
-        print(f"!!! Failed to get result for {image}")
+        logger.error(f"!!! Failed to get result for {image}")
         return
 
 
-async def main():
+@click.command()
+@click.option(
+    "--images-file",
+    help="YAML file containing list of images to scan",
+    required=True,
+    default="images.yaml",
+)
+@click.option(
+    "--skip-export",
+    help="Skip exporting images to tar files",
+    is_flag=True,
+)
+@click.option(
+    "--skip-scan",
+    help="Skip scanning with secscan-client",
+    is_flag=True,
+)
+@click.option(
+    "--output-dir",
+    help="Output directory for images, tokens and scans",
+    required=False,
+    default="output",
+)
+@coro
+async def main(images_file: str, skip_export: bool, skip_scan: bool, output_dir: str):
+    images: list[str] = []
+
+    try:
+        images = yaml.safe_load(open(images_file))["images"]
+    except Exception as e:
+        logger.error(f"Failed to read images from {images_file}: {e}")
+        return
+
+    if len(images) == 0:
+        logger.error(f"No images found in {images_file}")
+        return
+
+    OUTPUT_DIR = Path(output_dir)
+
     # Create output directory named after image and version
     for image in images:
-        print(f"Creating directory for {get_image_filename(image)}")
-        # Create directory
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / f"{get_image_filename(image)}").mkdir(parents=True, exist_ok=True)
+        if not OUTPUT_DIR.exists():
+            logger.info(f"Creating output directory {OUTPUT_DIR}")
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        else:
+            logger.info(f"Output directory {OUTPUT_DIR} already exists, skipping.")
 
-    save_image_tasks = [save_image(image) for image in images]
+        if not (OUTPUT_DIR / f"{get_image_filename(image)}").exists():
+            logger.info(f"Creating directory for {get_image_filename(image)}")
+            (OUTPUT_DIR / f"{get_image_filename(image)}").mkdir(
+                parents=True, exist_ok=True
+            )
+        else:
+            logger.info(
+                f"Directory for {get_image_filename(image)} already exists, skipping."
+            )
 
-    _ = await asyncio.gather(*save_image_tasks)
+    if not skip_export:
+        save_image_tasks = [save_image(image) for image in images]
 
-    run_scan_tasks = [run_scan(image) for image in images]
+        _ = await asyncio.gather(*save_image_tasks)
 
-    _ = await asyncio.gather(*run_scan_tasks)
+    if not skip_scan:
+        run_scan_tasks = [run_scan(image) for image in images]
 
-    print("Done")
+        _ = await asyncio.gather(*run_scan_tasks)
+
+    logger.success("Done")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # main is wrapped with coro, so we call it as a function even though it's a coroutine
+    main()
