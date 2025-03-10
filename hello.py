@@ -165,7 +165,7 @@ async def run_scan(image: str):
 @click.command()
 @click.option(
     "--images-file",
-    help="YAML file containing list of images to scan",
+    help="YAML file containing list of images to scan (defaults to ./images.yaml)",
     required=True,
     default="images.yaml",
 )
