@@ -69,7 +69,7 @@ async def save_image(image: str):
         else:
             logger.error(f"!!! Failed to export {image}.")
     else:
-        logger.info(f"File {image_path} already exists, skipping.")
+        logger.debug(f"File {image_path} already exists, skipping.")
 
 
 async def run_scan(image: str):
@@ -77,12 +77,12 @@ async def run_scan(image: str):
     image_path = IMAGE_DIR / f"{image_filename}.image"
 
     if not image_path.exists():
-        logger.info(f"Image {image_filename} does not exist, skipping scan.")
+        logger.warning(f"Image {image_filename} does not exist, skipping scan.")
         return
 
     # Verify the image file is valid
     if image_path.stat().st_size == 0:
-        logger.error(f"Image file {image_path} is empty, skipping scan.")
+        logger.warning(f"Image file {image_path} is empty, skipping scan.")
         return
 
     # Create the token directory if it doesn't exist yet
@@ -106,7 +106,8 @@ async def run_scan(image: str):
         )
         return
 
-    logger.info(f"Scan token for {image}: {scan_token_text}")
+    logger.info(f"Got scan token for {image}")
+    logger.debug(f"Token: {scan_token_text}")
 
     # Write token to file
     try:
@@ -208,18 +209,18 @@ async def main(images_file: str, skip_export: bool, skip_scan: bool, output_dir:
     # Create output directory named after image and version
     for image in images:
         if not OUTPUT_DIR.exists():
-            logger.info(f"Creating output directory {OUTPUT_DIR}")
+            logger.debug(f"Creating output directory {OUTPUT_DIR}")
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         else:
-            logger.info(f"Output directory {OUTPUT_DIR} already exists, skipping.")
+            logger.debug(f"Output directory {OUTPUT_DIR} already exists, skipping.")
 
         if not (OUTPUT_DIR / f"{get_image_filename(image)}").exists():
-            logger.info(f"Creating directory for {get_image_filename(image)}")
+            logger.debug(f"Creating directory for {get_image_filename(image)}")
             (OUTPUT_DIR / f"{get_image_filename(image)}").mkdir(
                 parents=True, exist_ok=True
             )
         else:
-            logger.info(
+            logger.debug(
                 f"Directory for {get_image_filename(image)} already exists, skipping."
             )
 
