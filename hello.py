@@ -1,6 +1,7 @@
 import click
 import yaml
 import asyncio
+import time
 from loguru import logger
 from pathlib import Path
 from functools import wraps
@@ -22,22 +23,37 @@ def get_image_filename(image: str):
     return image.split("/")[-1].split(":")[0]
 
 
-async def run_async(cmd: str) -> tuple[int, bytes]:
-    process = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
+async def run_async(cmd: str, max_retries=3, retry_delay=5) -> tuple[int, bytes]:
+    """Run a command with retry logic for transient failures."""
+    retries = 0
+    while retries <= max_retries:
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
 
-    if process.returncode != 0:
-        logger.error(f"Failed to run {cmd}")
-        logger.error(stderr.decode())
-        return 1, stderr
-    else:
-        logger.debug(f"Ran {cmd}")
+        if process.returncode != 0:
+            stderr_text = stderr.decode()
+            logger.error(f"Failed to run {cmd}")
+            logger.error(stderr_text)
 
-    return 0, stdout
+            # Check if this is a 400 bad request that might be due to timing
+            if "400" in stderr_text and retries < max_retries:
+                retries += 1
+                logger.warning(
+                    f"Received 400 error, retrying {retries}/{max_retries} in {retry_delay} seconds..."
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            return 1, stderr
+        else:
+            logger.debug(f"Ran {cmd}")
+            return 0, stdout
+
+    # If we've exhausted retries
+    return 1, b"Max retries exceeded"
 
 
 async def save_image(image: str):
@@ -64,45 +80,82 @@ async def run_scan(image: str):
         logger.info(f"Image {image_filename} does not exist, skipping scan.")
         return
 
+    # Verify the image file is valid
+    if image_path.stat().st_size == 0:
+        logger.error(f"Image file {image_path} is empty, skipping scan.")
+        return
+
+    # Create the token directory if it doesn't exist yet
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    token_file = TOKEN_DIR / f"{image_filename}.token"
+
     submit_scan_cmd = f"secscan-client submit --scanner blackduck --type container-image --format oci {image_path}"
+    logger.info(f"Submitting scan for {image}")
 
     code, scan_token = await run_async(submit_scan_cmd)
     if code != 0:
         logger.error(f"!!! Failed to submit scan for {image}")
         return
 
-    scan_token = scan_token.decode().strip().replace("Scan request submitted.", "")
+    scan_token_text = scan_token.decode().strip()
+    scan_token_text = scan_token_text.replace("Scan request submitted.", "").strip()
 
-    logger.info(f"Scan token for {image}: {scan_token}")
+    if not scan_token_text:
+        logger.error(
+            f"Empty scan token received for {image}, skipping further processing"
+        )
+        return
+
+    logger.info(f"Scan token for {image}: {scan_token_text}")
 
     # Write token to file
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    token_file = TOKEN_DIR / f"{image_filename}.token"
-    _ = token_file.write_text(scan_token)
+    try:
+        _ = token_file.write_text(scan_token_text)
+    except Exception as e:
+        logger.error(f"Failed to write token to file: {e}")
+        return
+
+    # Add a small delay to ensure token is fully processed by the system
+    await asyncio.sleep(1)
 
     wait_cmd = f"secscan-client wait --token {token_file}"
+    logger.info(f"Waiting for scan to complete for {image}")
 
-    code, _ = await run_async(wait_cmd)
+    code, _ = await run_async(wait_cmd, max_retries=5, retry_delay=10)
     if code != 0:
         logger.error(f"!!! Failed to wait for scan for {image_filename}")
         return
 
-    report_path = OUTPUT_DIR / f"{image_filename}/{image_filename}.report"
-    report_cmd = f"secscan-client report --token {token_file}"
+    # Ensure output directory exists
+    image_output_dir = OUTPUT_DIR / f"{image_filename}"
+    image_output_dir.mkdir(parents=True, exist_ok=True)
 
-    code, output = await run_async(report_cmd)
+    report_path = image_output_dir / f"{image_filename}.report"
+    report_cmd = f"secscan-client report --token {token_file}"
+    logger.info(f"Retrieving report for {image}")
+
+    code, report_output = await run_async(report_cmd)
     if code == 0:
-        _ = report_path.write_text(output.decode())
+        try:
+            _ = report_path.write_text(report_output.decode())
+            logger.info(f"Report saved to {report_path}")
+        except Exception as e:
+            logger.error(f"Failed to write report: {e}")
     else:
         logger.error(f"!!! Failed to get report for {image}")
         return
 
-    result_path = OUTPUT_DIR / f"{image_filename}/{image_filename}.result"
+    result_path = image_output_dir / f"{image_filename}.result"
     result_cmd = f"secscan-client result --token {token_file}"
+    logger.info(f"Retrieving result for {image}")
 
-    code, _ = await run_async(result_cmd)
+    code, result_output = await run_async(result_cmd)
     if code == 0:
-        _ = result_path.write_text(output.decode())
+        try:
+            _ = result_path.write_text(result_output.decode())
+            logger.info(f"Result saved to {result_path}")
+        except Exception as e:
+            logger.error(f"Failed to write result: {e}")
     else:
         logger.error(f"!!! Failed to get result for {image}")
         return
@@ -145,7 +198,12 @@ async def main(images_file: str, skip_export: bool, skip_scan: bool, output_dir:
         logger.error(f"No images found in {images_file}")
         return
 
+    global OUTPUT_DIR, TOKEN_DIR, IMAGE_DIR
     OUTPUT_DIR = Path(output_dir)
+    TOKEN_DIR = OUTPUT_DIR / "tokens"
+    IMAGE_DIR = OUTPUT_DIR / "images"
+
+    logger.info(f"Using output directory: {OUTPUT_DIR}")
 
     # Create output directory named after image and version
     for image in images:
